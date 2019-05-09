@@ -173,3 +173,171 @@ int hashTypeExists(robj *o, robj *field){
     }
     return 0;
 }
+
+/**
+ * Add an element, discard the old if the key already exists.
+ * Return 0 on insert and 1 on update.
+ * 
+ * This function will take care of incrementing the reference 
+ * count of the retained fields and value objects.
+ * 
+ * Return 0 means this element is already exists, this time
+ * is an update operation.
+ * 
+ * Return 1 means this elements is not exists, this time 
+ * is an add operation.
+ */ 
+int hashTypeSet(robj *o, robj *field, robj *value){
+    int update = 0;
+
+    if(o->encoding == REDIS_ENCODING_ZIPLIST){
+        unsigned char *zl, *fptr, *vptr;
+        
+        robj *field = getDecodedObject(field);
+        robj *value = getDecodedObject(value);
+        
+        zl = o->ptr;
+        fptr = ziplistIndex(zl, ZIPLIST_HEAD);
+        if(fptr != NULL){
+            fptr = ziplistFind(zl, field->ptr, sdslen(field->ptr), 1);
+            if(fptr != NULL){
+                //We find this element key
+                vptr = ziplistNext(zl, fptr);
+                redisAssert(vptr != NULL);
+                update = 1;
+
+                //This means we need to modify this content.
+                ziplistDelete(zl, &vptr);
+                ziplistInsert(zl, vptr, value->ptr, sdslen(value->ptr));
+            }
+        }
+
+        if(!update){
+            /*When we can't find this element, we push it into the tail of the ziplist*/
+            ziplistPush(zl, field->ptr, sdslen(field->ptr), ZIPLIST_TAIL);
+            ziplistPush(zl, value->ptr, sdslen(value->ptr), ZIPLIST_TAIL);
+        }
+        //Remember the operation to the ziplist may change the pointer of the original
+        //ziplsit.
+        o->ptr = zl;
+        decrRefCount(value);
+        decrRefCount(field);
+
+        /**
+         * We need to check after this set operation did we exceeds the maxmum of number
+         * if ziplist
+         */
+        if(hashTypeLength(o) > server.hash_max_ziplist_entries)
+            hashTypeConvert(o, REDIS_ENCODING_HT);
+    }else if(o->encoding == REDIS_ENCODING_HT){
+            //Replace this key in the dictionary
+            if(dictReplace(o->ptr, field, value)){
+                incrRefCount(field);
+            }else{
+                update = 1;
+            }
+    }else{
+        redisPainc("Unknown type");
+    }
+    return update;
+}
+
+/**
+ * Delete an element from a hash
+ * Returns 1 on  deleted and 0 on not found
+ */ 
+int hashTypeDelete(robj *o, robj *field){
+    int deleted = 0;
+    
+    if(o->encoding == REDIS_ENCODING_ZIPLIST){
+        unsigned char *zl, *fptr, vptr;
+        field = getDecodedObject(field);
+
+        zl = o->ptr;
+        fptr = ziplistIndex(zl, ZIPLIST_HEAD);
+        if(fptr != NULL){
+            fptr = ziplistFind(fptr, field->ptr, sdslen(field->ptr), 1);
+            if(fptr != NULL){
+                //The element is exists
+                vptr = ziplistNext(zl, fptr);
+                redisAssert(vptr != NULL);
+                zl = ziplistDelete(zl, &fptr);
+                zl = ziplistDelete(zl, &vptr);
+                o->ptr = zl;
+                deleted = 1;
+            }
+        }
+        decrRefCount(field);
+    }else if(o->encoding == REDIS_ENCODING_HT){
+        if(dictDelete((dict*)o->ptr, field) == DICT_OK){
+            deleted = 1;
+            /*Always check if the dictionary needs a resize after the delete*/
+            if(htNeedsResize(o->ptr)) dictResize(o->ptr);
+        }
+    }else{
+        redisPainc("Unknown type");
+    }
+    return deleted;
+}
+
+/**
+ * Returns the number of elements in hash 
+ */
+unsigned long hashTypeLength(robj *o){
+    unsigned long len;
+    if(o->encoding == REDIS_ENCODING_ZIPLIST){
+        len = ziplistLen(o->ptr) / 2;
+    }else if(o->encoding == REDIS_ENCODING_HT){
+        len = dictSize((dict *)o->ptr);
+    }else{
+        redisPainc("Unknown type");
+    }
+    return len;
+}
+
+/**
+ * Create a hash type iterator
+ * Time Complex: O(1) 
+ */
+hashTypeIterator *hashTypeInitIterator(robj *subject){
+    hashTypeIterator *it = zmalloc(sizeof(hashTypeIterator));
+    it->subject = subject;
+    it->encoding = subject->encoding;
+
+    if(it->encoding == REDIS_ENCODING_ZIPLIST){
+        it->fptr = NULL;
+        it->vptr = NULL;
+    }else if(it->encoding == REDIS_ENCODING_HT){
+        it->di = dictGetIterator(subject->ptr);
+    }else{
+        redisPainc("Unknown type");
+    }
+    return it;
+}
+
+/**
+ * Release the iterator 
+ */ 
+void hashTypeReleaseIterator(hashTypeIterator *hi){
+    if(hi->subject->encoding == REDIS_ENCODING_HT){
+        zfree(hi->di);
+    }
+    zfree(hi);
+}
+
+/**
+ * Move to the next entry in the hash.
+ * Could be found and REDIS_ERR when the iterator reaches the end.
+ * If found the REDIS_OK will return.
+ */ 
+int hashTypeNext(hashTypeIterator *hi){
+    if(hi->encoding == REDIS_ENCODING_ZIPLIST){
+        //todo
+    }else if(hi->encoding == REDIS_ENCODING_HT){
+        if((hi->de = dictNext(hi->di)) == NULL) return REDIS_ERR;
+    }else{
+        redisPainc("Unknown type");
+    }
+    return REDIS_OK;
+}
+

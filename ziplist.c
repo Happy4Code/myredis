@@ -695,7 +695,7 @@ unsigned char *ziplistPush(unsigned char *zl, unsigned char *s, unsigned int sle
 }
 
 /**
- * Returns an offset to use foriterating with ziplistNext. When the given index
+ * Returns an offset to use for iterating with ziplistNext. When the given index
  * is negetaive, the list is traversed back to front. When the list doesn't contain
  * an element at the provided index, NULL is returned.
  * 

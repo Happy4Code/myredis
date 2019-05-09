@@ -42,7 +42,7 @@ typedef struct dictType{
 	void *(*keyDup)(void *privdata, const void *key);
 	
 	//duplicate value function
-	void *(*valDup)(void *privdata, const void *obj)
+	void *(*valDup)(void *privdata, const void *obj);
 
 	//key compare function
 	int (*keyCompare)(void *privdata, const void *key1, const void *key2);
