@@ -205,7 +205,7 @@ dictIterator *dictGetSafeIterator(dict *d);
 dictEntry *dictNext(dictIterator *iter);
 void dictReleaseIterator(dictIterator *iter);
 dictEntry *dictGetRandomKey(dict *d);
-int dictGetRandomKeys(dict *d, dictEntry ***des, int count)
+int dictGetRandomKeys(dict *d, dictEntry ***des, int count);
 void dictPrintStats(dict *d);
 unsigned int dictGetHashFunction(const void *key, int len);
 unsigned int dictGenCaseHashFunction(const unsigned char *buf, int len);
@@ -223,4 +223,4 @@ extern dictType dictTypeHeapStringCopyKey;
 extern dictType dictTypeHeapStrings;
 extern dictType dictTypeHeapStringCopyKeyValue;
 
-#endif __DICT_H
+#endif

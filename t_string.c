@@ -66,7 +66,7 @@ void setGenericCommand(redisClient *c, int flags, robj *key, robj *val, robj *ex
 	//the options.
 	if((flags & REDIS_SET_NX && lookupKeyWrite(c->db, key) != NULL) ||
 	   (flags & REDIS_SET_XX && loopupKeyWrite(c->db, key) == NULL)){
-		adddReply(c, abort_reply ? abort_reply : shared.nullbulk);
+		addReply(c, abort_reply ? abort_reply : shared.nullbulk);
 		return;
 	}
 

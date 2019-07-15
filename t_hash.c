@@ -141,7 +141,7 @@ robj *hashTypeGetObject(robj *o, robj *field){
 
         if(hashTypeGetFromZiplist(o, field, &vstr, &vlen, &vll) == 0){
             if(vstr){
-                value = createStringObject(vstr, vlen);
+                value = createStringObject((char *)vstr, vlen);
             }else{
                 value = createStringObjectFromLongLong(vll);
             }
@@ -332,7 +332,29 @@ void hashTypeReleaseIterator(hashTypeIterator *hi){
  */ 
 int hashTypeNext(hashTypeIterator *hi){
     if(hi->encoding == REDIS_ENCODING_ZIPLIST){
-        //todo
+        unsigned char *zl;
+        unsigned char *fptr, vptr;
+
+        fptr = hi->fptr;
+        vptr = hi->vptr;
+        zl = hi->subject->ptr;
+        if(fptr == NULL){
+            /*Init to ZIPLIST HEAD*/
+            redisAssert(vptr == NULL);
+            fptr = ziplistIndex(zl, ZIPLIST_HEAD);
+        }else{
+            /**
+             * If the fptr is not empty, it means it is not the first time
+             * we iterate the ziplist, the vptr must not be NULL.
+             */ 
+            redisAssert(vptr == NULL);
+            fptr = ziplistNext(zl, vptr);
+        }
+        if(fptr == NULL) return REDIS_ERR;
+        vptr = ziplistNext(zl, fptr);
+        redisAssert(vptr == NULL);
+        hi->fptr = fptr;
+        hi->vptr = vptr;
     }else if(hi->encoding == REDIS_ENCODING_HT){
         if((hi->de = dictNext(hi->di)) == NULL) return REDIS_ERR;
     }else{
@@ -341,3 +363,571 @@ int hashTypeNext(hashTypeIterator *hi){
     return REDIS_OK;
 }
 
+/**
+ *  Get the field or value at iterator cursor, for an iterator on a hash value
+ *  encoded as a ziplist.Prototype is similar to `hashTypeGetFromZiplist`
+ *  We use the what to indicate we want to get the `key` or the `value`
+ *  from the ziplist.
+ */ 
+void hashTypeCurrentFromZiplist(hashTypeIterator *hi, int what, 
+                                unsigned char **vstr, 
+                                unsigned int *vlen, 
+                                long long *vll){
+    int ret;
+
+    //Make sure current working on a ziplist
+    redisAssert(hi->encoding == REDIS_ENCODING_ZIPLIST);
+
+    //Get the key
+    if(what & REDIS_HASH_KEY){
+        ret = ziplistGet(hi->fptr, vstr, vlen, vll);
+        redisAssert(ret);
+    }else{
+        ret = ziplistGet(hi->vptr, vstr, vlen, vll);
+        redisAssert(ret);
+    }
+}
+
+
+/**
+ * Get the field or value at iterator cursor, for an iterator on a hash value
+ * encoded as a hashtable. Prototype is similar to `hashTypeGetFromHashTable`
+ */ 
+void hashTypeCurrentFromHashTable(hashTypeIterator *hi, int what, robj **dst){
+
+    //Make sure current working on a hashtable
+    redisAssert(hi->encoding == REDIS_ENCODING_HT);
+
+    if(what & REDIS_HASH_KEY){
+        *dst = dictGetKey(hi->de);
+    }else{
+        *dst = dictGetVal(hi->de);
+    }
+}
+
+/**
+ * A non copy-on write friendly but higher level version of hashTypeCurrent*()
+ * thats returns an object with incremented refcount(or a new object).
+ * 
+ * It is up to the caller to decrRefCount() the object if no reference is retained.
+ */ 
+robj *hashTypeCurrentObject(hashTypeIterator *hi, int what){
+    robj *value = NULL;
+    if(hi->encoding == REDIS_ENCODING_ZIPLIST){
+        unsigned char *vstr = NULL;
+        unsigned int vlen = UINT_MAX;
+        long long vll = LLONG_MAX;
+
+        hashTypeCurrentFromZiplist(hi, what, &vstr, &vlen, &vll);
+        if(vstr){
+            value = createStringObject((char *)vstr, vlen);
+        }else{
+            value = createStringObjectFromLongLong(vll);
+        }
+    }else if(hi->encoding == REDIS_ENCODING_HT){
+        hashTypeCurrentFromHashTable(hi, what, &value);
+        incrRefCount(value);
+    }else{
+        redisPainc("Unknown type");
+    }
+    return value;
+}
+
+/**
+ * Find an object in the database based on the `key`,
+ * if existed return it otherwise create a new one.
+ */ 
+robj *hashTypeLookupWirteOrCreate(redisClient *c, robj *key){
+
+    robj *o = lookupKeyWrite(c->db, key);
+    if(o == NULL){
+        o = createHashObject();
+        dbAdd(c->db, key, o);
+    }else{
+        if(o->type != REDIS_HASH){
+            addReply(c, shared.wrongtypeerr);
+            return NULL;
+        }
+    }
+    return o;
+}
+
+/**
+ * Convert an object from ziplist encoding to hash encoding.
+ */ 
+void hashTypeConvertZiplist(robj *o, int enc){
+    
+    redisAssert(o->encoding == REDIS_ENCODING_ZIPLIST);
+    
+    if(enc == REDIS_ENCODING_ZIPLIST){
+
+    }else if(enc == REDIS_ENCODING_HT){
+
+        hashTypeIterator *hi =  hashTypeInitIterator(o);        
+        dict *d = dictCreate(&hashDictType, NULL);
+        robj *key, *value;
+        int ret;
+
+        while(hashTypeNext(hi) != REDIS_ERR){
+
+            key = hashTypeCurrentObject(hi, REDIS_HASH_KEY);
+            value = hashTypeCurrentObject(hi, REDIS_HASH_VALUE);
+
+            hashTypeTryObjectEncoding(d, &key, &value);
+            ret = dictAdd(d, key, value);
+             if (ret != DICT_OK) {
+                redisLogHexDump(REDIS_WARNING,"ziplist with dup elements dump",
+                    o->ptr,ziplistBlobLen(o->ptr));
+                redisAssert(ret == DICT_OK);
+            }
+        }
+
+        hashTypeReleaseIterator(hi);
+        free(o->ptr);
+        o->ptr = d;
+        o->encoding = REDIS_ENCODING_HT;
+    }else{
+        redisPainc("Unknown type");
+    }
+}
+
+/**
+ *  Do the encoding convert for hash object o.
+ *  Current only working on ZIPLIST to HT. 
+ */ 
+void hashTypeConvert(robj *o, int enc){
+
+    if(o->encoding == REDIS_ENCODING_ZIPLIST){
+        hashTypeConvertZiplist(o, enc);
+    }else if(o->encoding == REDIS_ENCODING_HT){
+        redisPanic("Not implemented");
+    } else {
+        redisPanic("Unknown hash encoding");
+    }
+}
+
+/**
+ * Hash type Command
+ */
+void hsetCommand(redisClient *c){
+    int update;
+    robj *o;
+
+    if((o = hashTypeLookupWirteOrCreate(c, c->argv[1])) == NULL) return;
+
+    hashTypeTryConversion(o, c->argv, 2, 3);
+    
+    c->argv[2] = tryObjectEncoding(c->argv[2]);
+    c->argv[3] = tryObjectEncoding(c->argv[3]);
+
+    update = hashTypeSet(o, c->argv[2], c->argv[3]);
+
+    addReply(c, update ? shared.czero : shared.cone);
+
+    //Send the signal
+    signalModifiedKey(c->db, c->argv[1]);
+
+    //Notify the event
+    notifyKeyspaceEvent(REDIS_NOTIFY_HASH, "hset", c->argv[1], c->db->id);
+
+    //incr the server dirty
+    server.dirty++;
+}
+
+/**
+ * For a long time, i found a problem.When the redis save data as a t_hash type
+ * they will encode the field and value before put them into the databse.But 
+ * when they do some operation such as `hsetnxCommand` which needs to check
+ * if a given field is existed.This time the input field is unencoded.Here 
+ * arise a question, the data is saved as encoded, but when we query them
+ * the input always are unencoded, how this work?
+ * 
+ * When we reading the source code of the tryObjectEncoding() method, and 
+ * getDecodeObject() method, we make it out!
+ * 
+ * The tryObjectEncoding() method will do something:
+ * 1.If the input object is a shared object, we do nothing.
+ * 2.If the input is a EMBER or RAW encoding, we encoded it.
+ * 3.If the input is a long data type, we use the ptr pointer to directly save it.
+ * 
+ * The getDecodeObject() method will restore the object as a string 
+ * if it encoding is INT.Ohterwise it only increment the refCount.
+ * 
+ * So we need to figure out when tryObjectEncoding() encode an object, what does he do?
+ * There a two ways:
+ * 1.Encode it as an ember string, which combine the sds structure and the o->ptr.
+ * 2.Free unnecessary space.
+ * 
+ * The two ways never change the content, it modify the structure of an object, but
+ * keep o->ptr and o->len remains the same as the input, so for example in ziplist,
+ * we use memcmp() to compare if a entry match the given input.That works well!. 
+ */ 
+void hsetnxCommand(redisClient *c){
+    
+    robj *o;
+    if((o = hashTypeLookupWirteOrCreate(c, c->argv[1])) == NULL) return;
+
+    hashTypeTryConversion(o, c->argv, 2, 3);
+
+    if(hashTypeExists(o, c->argv[2])) {
+        addReply(c, shared.czero);
+        return;
+    }
+    //Encoding the field and value
+    hashTypeTryObjectEncoding(o, &c->argv[2], &c->arv[3]);
+    hashTypeSet(o, c->argv[2], c->argv[3]);
+    addReply(c, shared.cone);
+
+    //Send the signal 
+    signalModifiedKey(c->db, c->argv[1]);
+
+    //Notify the event
+    notifyKeyspaceEvent(REDIS_NOTIFY_HASH, "hset", c->argv[1], c->db->id);
+
+    //incr the server dirty
+    server.dirty++;
+}
+
+void hmsetCommand(redisClient *c){
+    
+    int i;
+    robj *o;
+
+    if(c->argc % 2 != 0){
+        addReplyError(c, "wrong number of arguments for HMSET");
+        return;
+    }
+
+    if((o = hashTypeLookupWirteOrCreate(c, c->argv[1])) == NULL) return;
+
+    //Check the inputs are they exceeds the limit of the node size
+    hashTypeTryConversion(o, c->argv, 2, c->argc - 1);
+    
+    for(i = 2; i < c->argc; i += 2){
+        hashTypeTryObjectEncoding(o, &c->argv[i], &c->argv[i+1]);
+        hashTypeSet(o, c->argv[i], c->argv[i+1]);
+    }
+
+    //Send the reply to the client 
+    addReply(c, shared.ok);
+
+    //Send the key modified signal
+    signalModifiedKey(c->db, c->argv[1]);
+
+    //Send event notification
+    notifyKeyspaceEvent(REDIS_NOTIFY_HASH, "hset", c->argv[1], c->db->id);
+
+    //set the db as dirty
+    server.dirty++;
+}
+
+void hincrbyCommand(redisClient *c){
+    
+    long long value, incr, oldvalue;
+    robj *o, *current, *new;
+
+    if(getLongLongFromObjectOrReply(c, c->argv[3], &incr, NULL) == REDIS_ERR) return;
+
+    if((o = hashTypeLookupWirteOrCreate(c, c->argv[1])) == NULL) return;
+
+    //check if current field related value is existed.
+    if((current = hashTypeGetObject(o, c->argv[2])) != NULL){
+        //get the value 
+        if(getLongLongFromObjectOrReply(c, current, &value, "hash value is not an integer") != REDIS_OK){
+            decrRefCount(current);
+            return;
+        }
+    }else{
+        value = 0;
+    }
+    //Check if the incr operation will cause over-flow
+    oldvalue = value;
+    if((oldvalue < 0 && incr < 0 && incr < (LLONG_MIN - oldvalue)) ||
+       (oldvalue > 0 && incr > 0 && incr > (LLONG_MAX - oldvalue))){
+           addReplyError(c, "increment or decrement would overflow");
+           return;
+       }
+    value = value + incr;
+    //Create a object from the value
+    new = createStringObjectFromLongLong(value);
+    tryObjectEncoding(o, c->argv[2]);
+    //Associate the new value with the key
+    hashTypeSet(o, c->argv[2], new);
+    decrRefCount(new);
+
+    //Returns the result as reply
+    addReplyLongLong(c, value);
+
+    //Send signal
+    signalModifiedKey(c->db, c->argv[1]);
+
+    //Notify 
+    notifyKeyspaceEvent(REDIS_NOTIFY_HASH, "hincrby", c->argv[1], c->db->id);
+
+    server.dirty++;
+}
+
+void hincrbyfloatCommand(redisClient *c){
+    long double incr, value;
+    robj *o, *new, *old, *aux;
+
+    if(getLongDoubleFromObjectOrReply(c, c->argv[3], &incr, NULL) != REDIS_OK) return;
+
+    if((o = hashTypeLookupWirteOrCreate(c, c->argv[1])) == NULL) return;
+
+    if((old = hashTypeGetObject(o, c->argv[2])) != NULL){
+        //Try this value if it is a double
+        if(getLongDoubleFromObjectOrReply(c, old, &value, "hash value is not an double") != REDIS_OK){
+            decrRefCount(old);
+            return;
+        }
+    }else{
+        value = 0.0;
+    }
+    //do the add oepration
+    value += incr;
+    if(isnan(value) || isinf(value)){
+        addReplyError(c, "increment would product Nan or Infinity");
+		return;
+    }
+    new = createStringObjectFromLongDouble(value);
+
+    tryObjectEncoding(o, c->argv[2]);
+    //Associate the new value with the key
+    hashTypeSet(o, c->argv[2], new);
+
+    //Returns the result as reply
+    addReplyBulk(c, new);
+
+    //Send signal
+    signalModifiedKey(c->db, c->argv[1]);
+
+    //Notify 
+    notifyKeyspaceEvent(REDIS_NOTIFY_HASH, "hincrbyfloat", c->argv[1], c->db->id);
+
+    server.dirty++;
+
+    /* Always replicate HINCRBYFLOAT as an HSET command with the final value
+     * in order to make sure that differences in float pricision or formatting
+     * will not create differences in replicas or after an AOF restart. */
+    // 在传播 INCRBYFLOAT 命令时，总是用 SET 命令来替换 INCRBYFLOAT 命令
+    // 从而防止因为不同的浮点精度和格式化造成 AOF 重启时的数据不一致
+    aux = createStringObject("HSET", 4);
+    rewriteClientCommandArgument(c, 0, aux);
+    decrRefCount(aux);
+    rewriteClientCommandArgument(c, 3, new);
+    decrRefCount(new);
+}
+
+/**
+ * Helper function: set the value object into the return.
+ */ 
+static void addHashFieldToReply(redisClient *c, robj *o, robj *field){
+
+    //If the o is not existed.
+    if(o == NULL){
+        addReply(c, shared.nullbulk);
+        return;
+    }
+
+    //ziplist
+    if(o->encoding == REDIS_ENCODING_ZIPLIST){
+        unsigned char *vstr = NULL;
+        unsigned int vlen = UINT_MAX;
+        long long vll = LLONG_MAX;
+
+        if(hashTypeGetFromZiplist(o, field, &vstr, &vlen, &vll) < 0){
+            addReply(c, shared.nullbulk);
+            return;
+        }else{
+            if(vstr){
+                addReplyBulkCBuffer(c, vstr, vlen);
+            }else{
+                addReplyBulkLongLong(c, vll);
+            }
+        }
+
+    }else if(o->encoding == REDIS_ENCODING_HT){
+        robj *value;
+
+        //Get the value
+        if(hashTypeGetFromHashTable(o, field, &value) < 0){
+            addReply(c, shared.nullbulk);
+        }else{
+            addReplyBulk(c, value);
+        }
+    }else{
+        redisPanic("Unknown hash encoding");
+    }
+}
+
+void hgetCommand(redisClient *c){
+    robj *o;
+
+    if((o = lookupKeyReadOrReply(c, c->argv[1], shared.nullbulk)) == NULL ||
+       chechType(c, REDIS_HASH)) return;
+    
+    //Get and return the value
+    addHashFieldToReply(c, o, c->argv[2]);
+}
+
+void hmgetCommand(redisClient *c){
+    robj *o;
+    int i;
+
+    /**
+     * Don't abort when the key cannot be found. Non-existing keys are empty hashes,
+     * when HMGET should respond with a series of full bulks.
+     */ 
+    if((o = lookupKeyRead(c->db, c->argv[])) == NULL ||
+        chechType(c, o, REDIS_HASH)) return;
+    
+    //Get mutiple field value
+    addReplyMultiBulkLen(c. c->argc-2);
+    for(i = 2; i < c->argc; i++){
+        addHashFieldToReply(c, o, c->argv[i]);
+    }
+}
+
+void hdelCommand(redisClient *c){
+    robj *o;
+    int j, deleted = 0, keyremove = 0;
+
+    //Get the object
+    if((o = lookupKeyWriteOrReply(c, c->argv[1], shared.czero)) == NULL ||
+       checkType(c, o, REDIS_HASH)) return;
+
+    for(j = 2; j < c->argc; j++){
+        if(hashTypeDelete(o, c->argv[j]){
+
+            //if we success remove a item, incr the variable
+            deleted++;
+
+            //If the hash type is empty, the we need to remove the key
+            if(hashTypeLength(o) == 0){
+                dbDelete(c->db, c->argv[1]);
+                keyremove = 1;
+                break;
+            }
+        }
+    }
+
+    //If at least on key is delete, then triggle the following code.
+    if(deleted){
+            //Send signal
+            signalModifiedKey(c->db, c->argv[1]);
+            
+            //Send event notification
+            notifyKeyspaceEvent(REDIS_NOTIFY_HASH, "hdel", c->argv[1], c->db->id);
+
+            //Send event notification if the key is remove
+            if(keyremove)
+                notifyKeyspaceEvent(REDIS_NOTIFY_GENERIC, "del", c->argv[1], c->db->id);
+            
+            //Send the database as dirty
+            server.dirty += deleted;
+    }
+    addReplyLongLong(c, deleted);
+}
+
+void hlenCommand(redisClient *c){
+    robj *o;
+
+    //Get the object
+    if((o = lookupKeyWriteOrReply(c, c->argv[1], shared.czero)) == NULL ||
+       checkType(c, o, REDIS_HASH)) return;
+
+    addReplyLongLong(c, hashTypeLength(o));
+}
+
+/**
+ * Get the current cursor pointed item at the iterator
+ */
+static void addHashIteratorCursorToReply(redisClient *c, hashTypeIterator *hi, int what){
+
+    //Here is a point we don't use the hashTypeCurrentObject, the hashTypeCurrent provide the 
+    //similiar function, why? The reason may be that, when u look at the code of `hashTypeCurrent`
+    //it get the current value from the iterator and encapsulate it into an object then return.
+    //We have different function to reply to the client according to the input type, we need to
+    //use different function to return to client but the `hashTypeCurrent` only returns object
+    //This may be the reason.
+    if(hi->encoding == REDIS_ENCODING_ZIPLIST){
+        unsigned char *vstr = NULL;
+        unsigned int len = UINT_MAX;
+        long long vll = LLONG_MAX;
+        
+        hashTypeCurrentFromZiplist(hi, what, &vstr, &len, &vll);
+
+        if(vstr){
+            addReplyBulkCBuffer(c, vstr, vlen);
+        }else{
+            addReplyBulkLongLong(c, vll);
+        }
+
+    }else if(hi->encoding == REDIS_ENCODING_HT){
+        robj *o = NULL;
+        hashTypeCurrentFromHashTable(hi, what, &o);
+        addReplyBulk(c, o);
+
+    }else{
+        redisPanic("Unknown hash encoding");
+    }
+}
+
+void genericHgetallCommand(redisClient *c, int flags){
+    robj *o;
+    hashTypeIterator *hi;
+    int multiplier = 0;
+    int length, count = 0
+
+    if((o = lookupKeyReadOrReply(c, c->argv[1], shared.emptymultibulk)) == NULL ||
+        chechType(o, REDIS_HASH)) return;
+    
+    hi = hashTypeInitIterator(o);
+
+    //Caculate how much item i need to get
+    if(flags & REDIS_HASH_KEY) multiplier++;
+    if(flags & REDIS_HASH_VALUE) multiplier++;
+
+    length = hashTypeLength(o) * multiplier;
+
+    while(hashTypeNext(hi) != REDIS_ERR){
+        if(flags & REDIS_HASH_KEY){
+            addHashIteratorCursorToReply(c, hi, REDIS_HASH_KEY);
+            count++
+        }
+        if(flag &REDIS_HASH_VALUE){
+            addHashIteratorCursorToReply(c, hi, REDIS_HASH_VALUE);
+            count++
+        }
+    }
+
+        // 释放迭代器
+    hashTypeReleaseIterator(hi);
+    redisAssert(count == length);
+}
+
+void hkeysCommand(redisClient *c){
+    genericHgetallCommand(c, REDIS_HASH_KEY);
+}
+
+void hvalsCommand(redisClient *c){
+    genericHgetallCommand(c, REDIS_HASH_VALUE);
+}
+
+void hgetallCommand(redisClient *c){
+    genericHgetallCommand(c, REDIS_HASH_KEY | REDIS_HASH_VALUE);
+}
+
+void hexistsCommand(redisClient *c){
+    robj *o;
+
+    if((o = lookupKeyReadOrReply(c, c->argv[1], shared.czero)) == NULL ||
+        chechType(o, REDIS_HASH)) return;
+    
+    addReply(c, hashTypeExists(o, c->argv[2]) ? shared.cone : shared.czero);
+}
+
+void hscanCommand(redisClient *c){
+
+}
